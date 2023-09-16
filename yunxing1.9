@@ -1,0 +1,228 @@
+import tkinter as tk
+from tkinter import messagebox
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+import numpy as np
+import os
+import keras
+from tensorflow.keras.models import load_model
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Bidirectional, LSTM, Dense
+from tensorflow.keras.utils import to_categorical
+# 全局变量
+model_bai = None
+model_shi = None
+model_ge = None
+
+try:
+    with open('data/new_issue.txt', 'r') as file:
+        saved_issue = file.read()
+        new_issue_entry.insert(0, saved_issue)
+except FileNotFoundError:
+    pass  # 如果文件不存在，忽略错误
+def load_model_if_exists():
+    global model_bai, model_shi, model_ge
+    try:
+        model_bai = load_model('lstm_model_bai.keras')
+        model_shi = load_model('lstm_model_shi.keras')
+        model_ge = load_model('lstm_model_ge.keras')
+    except (OSError, ValueError):
+        pass  # 如果加载失败，保持模型为None
+
+# 在程序启动时尝试加载模型
+load_model_if_exists()
+# 数据读取和特征计算
+def load_and_process_data(window_size=10):
+    data_folder = "data"  # 数据文件夹路径
+    data_files = [os.path.join(data_folder, f) for f in os.listdir(data_folder) if f.endswith('.csv')]
+
+    # 指定列名，确保与你的数据文件结构匹配
+    column_names = ["期号", "百位", "十位", "个位"]
+
+    # 读取CSV文件并跳过第一列（期号）
+    data = pd.concat([pd.read_csv(f, names=column_names, encoding='gbk') for f in data_files], ignore_index=True)
+    data = data.iloc[1:]  # 去掉第一行，因为它是列名而不是数据
+    # 特征工程部分
+    for i in range(window_size):
+        data[f'百位_lag_{i + 1}'] = data['百位'].shift(i + 1)
+        data[f'十位_lag_{i + 1}'] = data['十位'].shift(i + 1)
+        data[f'个位_lag_{i + 1}'] = data['个位'].shift(i + 1)
+
+    # 特征工程部分
+    data['百位_mean'] = data['百位'].rolling(window=window_size).mean()
+    data['十位_mean'] = data['十位'].rolling(window=window_size).mean()
+    data['个位_mean'] = data['个位'].rolling(window=window_size).mean()
+
+    data['百位_median'] = data['百位'].rolling(window=window_size).median()
+    data['十位_median'] = data['十位'].rolling(window=window_size).median()
+    data['个位_median'] = data['个位'].rolling(window=window_size).median()
+
+    data['百位_std'] = data['百位'].rolling(window=window_size).std()
+    data['十位_std'] = data['十位'].rolling(window=window_size).std()
+    data['个位_std'] = data['个位'].rolling(window=window_size).std()
+
+    # 大小比特征
+    data['百位_large_ratio'] = data['百位'].rolling(window=window_size).apply(lambda x: sum(x > 5) / window_size)
+    data['十位_large_ratio'] = data['十位'].rolling(window=window_size).apply(lambda x: sum(x > 5) / window_size)
+    data['个位_large_ratio'] = data['个位'].rolling(window=window_size).apply(lambda x: sum(x > 5) / window_size)
+
+    # 奇偶比特征
+    data['百位_odd_ratio'] = data['百位'].rolling(window=window_size).apply(lambda x: sum(x % 2 == 1) / window_size)
+    data['十位_odd_ratio'] = data['十位'].rolling(window=window_size).apply(lambda x: sum(x % 2 == 1) / window_size)
+    data['个位_odd_ratio'] = data['个位'].rolling(window=window_size).apply(lambda x: sum(x % 2 == 1) / window_size)
+
+    # 连号特征
+    data['百位_consecutive_count'] = data['百位'].rolling(window=window_size).apply(lambda x: sum(np.diff(x) == 1))
+    data['十位_consecutive_count'] = data['十位'].rolling(window=window_size).apply(lambda x: sum(np.diff(x) == 1))
+    data['个位_consecutive_count'] = data['个位'].rolling(window=window_size).apply(lambda x: sum(np.diff(x) == 1))
+
+    # 跨度特征
+    data['百位_span'] = data['百位'].rolling(window=window_size).apply(lambda x: x.max() - x.min())
+    data['十位_span'] = data['十位'].rolling(window=window_size).apply(lambda x: x.max() - x.min())
+    data['个位_span'] = data['个位'].rolling(window=window_size).apply(lambda x: x.max() - x.min())
+
+    # 012路特征
+    data['百位_012_road'] = data['百位'].rolling(window=window_size).apply(lambda x: sum(x % 3 == 0) / window_size)
+    data['十位_012_road'] = data['十位'].rolling(window=window_size).apply(lambda x: sum(x % 3 == 1) / window_size)
+    data['个位_012_road'] = data['个位'].rolling(window=window_size).apply(lambda x: sum(x % 3 == 2) / window_size)
+    # 和值特征
+    data['sum'] = data['百位'] + data['十位'] + data['个位']
+
+    data.dropna(inplace=True)
+
+    return data
+
+
+
+
+# 模型训练
+def train_model(data):
+    X = data.drop(['期号', '百位', '十位', '个位'], axis=1)
+    y = data[['百位', '十位', '个位']]
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    scaler = MinMaxScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    # 分别为百位、十位和个位创建模型
+    model_bai = Sequential([  # 使用 Sequential 模型
+        Bidirectional(LSTM(64, return_sequences=True), input_shape=(X_train.shape[1], 1)),
+        Bidirectional(LSTM(64)),
+        Dense(30, activation='relu'),
+        Dense(10, activation='softmax', name='output_bai')
+    ])
+
+    model_shi = Sequential([  # 使用 Sequential 模型
+        Bidirectional(LSTM(64, return_sequences=True), input_shape=(X_train.shape[1], 1)),
+        Bidirectional(LSTM(64)),
+        Dense(30, activation='relu'),
+        Dense(10, activation='softmax', name='output_shi')
+    ])
+
+    model_ge = Sequential([  # 使用 Sequential 模型
+        Bidirectional(LSTM(64, return_sequences=True), input_shape=(X_train.shape[1], 1)),
+        Bidirectional(LSTM(64)),
+        Dense(30, activation='relu'),
+        Dense(10, activation='softmax', name='output_ge')
+    ])
+
+    model_bai.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    model_shi.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    model_ge.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+    model_bai.fit(X_train, to_categorical(y_train['百位'], num_classes=10), epochs=10, batch_size=32,
+                  validation_data=(X_test, to_categorical(y_test['百位'], num_classes=10)))
+
+    model_shi.fit(X_train, to_categorical(y_train['十位'], num_classes=10), epochs=10, batch_size=32,
+                  validation_data=(X_test, to_categorical(y_test['十位'], num_classes=10)))
+
+    model_ge.fit(X_train, to_categorical(y_train['个位'], num_classes=10), epochs=10, batch_size=32,
+                 validation_data=(X_test, to_categorical(y_test['个位'], num_classes=10)))
+
+    # 保存模型
+    model_bai.save('lstm_model_bai.keras')
+    model_shi.save('lstm_model_shi.keras')
+    model_ge.save('lstm_model_ge.keras')
+    return model_bai, model_shi, model_ge  # 返回三个模型
+    # 加载已保存的模型
+    loaded_model_bai = keras.models.load_model('lstm_model_bai.keras')
+    loaded_model_shi = keras.models.load_model('lstm_model_shi.keras')
+    loaded_model_ge = keras.models.load_model('lstm_model_ge.keras')
+
+    return loaded_model_bai, loaded_model_shi, loaded_model_ge
+
+def save_data():
+    data = entry.get()  # 获取输入框中的数据
+    if data:
+        data_list = data.split(',')  # 假设数据是以逗号分隔的
+        if len(data_list) == 4:  # 确保有4个数据点（期号，百位，十位，个位）
+            with open("data/new_data.csv", "a") as file:  # 以追加模式打开文件
+                file.write(data + '\n')  # 将数据写入文件
+            entry.delete(0, tk.END)  # 清空输入框
+            label.config(text="数据已保存！")
+            update_sample_data()  # 调用update_sample_data函数来更新样本数据和重新训练模型
+        else:
+            label.config(text="请输入有效数据格式：期号,百位,十位,个位")
+    else:
+        label.config(text="请输入数据！")
+
+def update_sample_data():
+    global model_bai, model_shi, model_ge
+    data = load_and_process_data()
+    model_bai, model_shi, model_ge = train_model(data)
+    messagebox.showinfo("信息", "样本数据已更新，模型已重新训练")
+
+# 修改 predict 函数
+def predict():
+    global model_bai, model_shi, model_ge  # 使用全局变量 model_bai, model_shi, model_ge
+    if model_bai is None or model_shi is None or model_ge is None:
+        messagebox.showinfo("错误", "模型尚未加载")
+        return
+
+    # 获取用户输入的数据并将其转换成模型可接受的格式
+    user_input = entry.get()  # 假设用户在文本框中输入数据
+    user_input = user_input.split()  # 假设用户输入的数据是以空格分隔的
+
+    # 将用户输入的数据转换成 numpy 数组
+    input_data = np.array(user_input, dtype=float)  # 假设用户输入的数据是浮点数
+
+    # 使用模型进行预测
+    if len(input_data) == 55:  # 假设特征数量是 55
+        input_data = input_data.reshape(1, 55, 1)  # 将特征数量替换为实际的特征数量
+        predictions_bai = model_bai.predict(input_data)
+        predictions_shi = model_shi.predict(input_data)
+        predictions_ge = model_ge.predict(input_data)
+
+        # 从预测中提取每个位置的五个数字
+        top_5_predictions_bai = predictions_bai[0].argsort()[-5:][::-1]  # 百位的预测
+        top_5_predictions_shi = predictions_shi[0].argsort()[-5:][::-1]  # 十位的预测
+        top_5_predictions_ge = predictions_ge[0].argsort()[-5:][::-1]  # 个位的预测
+
+        result_text = f"百位预测: {top_5_predictions_bai}\n十位预测: {top_5_predictions_shi}\n个位预测: {top_5_predictions_ge}"
+        messagebox.showinfo("预测结果", result_text)
+    else:
+        messagebox.showinfo("错误", "输入的数据特征数量不匹配")
+
+# GUI界面
+root = tk.Tk()
+root.title("彩票预测")
+
+label = tk.Label(root, text="请输入期号、百位、十位和个位（用逗号分隔）：")
+label.pack()
+
+entry = tk.Entry(root)  # 创建文本输入框
+entry.pack()  # 将文本输入框添加到窗口中
+
+save_button = tk.Button(root, text="保存数据", command=save_data)
+save_button.pack()
+
+update_button = tk.Button(root, text="更新样本数据", command=update_sample_data)
+update_button.pack()
+
+predict_button = tk.Button(root, text="进行预测", command=predict)
+predict_button.pack()
+
+root.mainloop()
